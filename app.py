@@ -4,12 +4,16 @@ import io
 import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List
 
 import streamlit as st
 
 DEFAULT_MODEL = "gemini-3.5-flash"  # override with GEMINI_MODEL (env var or secret)
+FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]  # tried if the main model is busy
+RETRIES_PER_MODEL = 3  # attempts per model, with exponential backoff (2s, 4s)
+RETRYABLE_CODES = {429, 500, 502, 503, 504}
 MAX_FILE_MB = 5
 MAX_CHARS = 15000  # resume text sent to the model
 MIN_CHARS = 150  # below this, the file is probably a scanned image
@@ -172,21 +176,67 @@ def parse_response(raw: str) -> Analysis:
     )
 
 
-def analyze_resume(resume: str, job_description: str, api_key: str, model: str) -> Analysis:
-    from google import genai
-    from google.genai import types
+def _error_code(exc: Exception):
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    if isinstance(code, int):
+        return code
+    match = re.match(r"\s*(\d{3})\b", str(exc))
+    return int(match.group(1)) if match else None
 
-    client = genai.Client(api_key=api_key)
+
+def _generate(client, types, model: str, prompt: str) -> str:
     response = client.models.generate_content(
         model=model,
-        contents=build_prompt(resume, job_description),
+        contents=prompt,
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_INSTRUCTION,
             temperature=0.2,
             response_mime_type="application/json",
         ),
     )
-    return parse_response(response.text)
+    return response.text
+
+
+def analyze_resume(resume, job_description, api_key, model, sleep=time.sleep):
+    """Call Gemini with retries and model fallback. Returns (Analysis, model_used).
+
+    - 429/5xx (e.g. "503 high demand"): retry with backoff, then try the next model.
+    - 404 (model name not found): go straight to the next model.
+    - 400/401/403 (bad key or request): stop and report immediately.
+    """
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=api_key)
+    prompt = build_prompt(resume, job_description)
+    models = [model] + [m for m in FALLBACK_MODELS if m != model]
+    last_error = None
+
+    for name in models:
+        for attempt in range(RETRIES_PER_MODEL):
+            try:
+                return parse_response(_generate(client, types, name, prompt)), name
+            except ValueError as exc:  # unreadable JSON from the model: retry
+                last_error = exc
+            except Exception as exc:
+                last_error = exc
+                code = _error_code(exc)
+                if code in (400, 401, 403):
+                    raise RuntimeError(
+                        "Gemini rejected the request. Check that your API key is valid "
+                        f"and allowed to use this model. ({exc})"
+                    ) from exc
+                if code == 404:
+                    break  # unknown model name -> next model
+                if code not in RETRYABLE_CODES and "UNAVAILABLE" not in str(exc):
+                    raise
+            if attempt < RETRIES_PER_MODEL - 1:
+                sleep(2 ** (attempt + 1))
+
+    raise RuntimeError(
+        "Gemini is overloaded right now and all retries failed. "
+        f"Please try again in a minute. (Last error: {last_error})"
+    )
 
 
 # -------------------------------------------------------------------------- UI
@@ -207,8 +257,10 @@ def score_label(score: int) -> str:
     return "Weak"
 
 
-def render(analysis: Analysis, text: str) -> None:
+def render(analysis: Analysis, text: str, model_used: str = "") -> None:
     st.subheader("Your ATS Score")
+    if model_used:
+        st.caption(f"Analyzed with {model_used}")
     left, right = st.columns([1, 3])
     left.metric("Score", f"{analysis.ats_score} / 100")
     right.progress(analysis.ats_score / 100, text=score_label(analysis.ats_score))
@@ -290,11 +342,11 @@ def main() -> None:
             return
         with st.spinner("Analyzing your resume..."):
             try:
-                analysis = analyze_resume(text, job_description, api_key, model)
+                analysis, model_used = analyze_resume(text, job_description, api_key, model)
             except Exception as exc:
                 st.error(f"Analysis failed: {exc}")
                 return
-        render(analysis, text)
+        render(analysis, text, model_used)
 
 
 if __name__ == "__main__":
