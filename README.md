@@ -24,7 +24,7 @@ Get a free API key at https://aistudio.google.com/apikey, then either:
 
 ```toml
 GEMINI_API_KEY = "your-key-here"
-# GEMINI_MODEL = "gemini-3.5-flash"   # optional, change if Google renames the model
+# GEMINI_MODEL = "gemini-3.6-flash"   # optional, change if Google renames the model
 ```
 
 Run:
@@ -58,9 +58,10 @@ git push -u origin main
 ## Notes
 
 - **503 "high demand" errors:** the app retries automatically (2s, 4s backoff) and then falls back to
-  `gemini-2.5-flash` and `gemini-2.5-flash-lite`. The report shows which model was used. If all fail,
-  wait a minute and retry. Edit `FALLBACK_MODELS` in `app.py` to change the fallback list.
+  `gemini-3.8-flash`, `gemini-3.5-flash-lite` and `gemini-flash-latest`. If those are unavailable it asks the API
+  which Flash models your key can use. The report shows which model was used. Edit `FALLBACK_MODELS` in `app.py`
+  to change the list.
 - Scanned/image-only PDFs have no text to read; export a text-based PDF or use DOCX.
-- Default model is `gemini-3.5-flash`. If you get a "model not found" error, set
+- Default model is `gemini-3.6-flash`. If you get a "model not found" error, set
   `GEMINI_MODEL` (or edit the Model box in the sidebar) to a current Flash model name.
 - Resume text is sent to the Gemini API. Don't upload documents you can't share with it.
