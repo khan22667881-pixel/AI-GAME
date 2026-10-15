@@ -1,4 +1,3 @@
-# AI-GAME
 # 📄 ATS Resume Checker
 
 Upload a resume (PDF, DOCX or TXT) and get an estimated **ATS score**, a score breakdown,
@@ -58,6 +57,9 @@ git push -u origin main
 
 ## Notes
 
+- **503 "high demand" errors:** the app retries automatically (2s, 4s backoff) and then falls back to
+  `gemini-2.5-flash` and `gemini-2.5-flash-lite`. The report shows which model was used. If all fail,
+  wait a minute and retry. Edit `FALLBACK_MODELS` in `app.py` to change the fallback list.
 - Scanned/image-only PDFs have no text to read; export a text-based PDF or use DOCX.
 - Default model is `gemini-3.5-flash`. If you get a "model not found" error, set
   `GEMINI_MODEL` (or edit the Model box in the sidebar) to a current Flash model name.
