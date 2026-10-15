@@ -10,9 +10,10 @@ from typing import Dict, List
 
 import streamlit as st
 
-DEFAULT_MODEL = "gemini-3.5-flash"  # override with GEMINI_MODEL (env var or secret)
-FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]  # tried if the main model is busy
+DEFAULT_MODEL = "gemini-3.6-flash"  # override with GEMINI_MODEL (env var or secret)
+FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-flash-latest"]  # tried in order if the main model is busy/missing
 RETRIES_PER_MODEL = 3  # attempts per model, with exponential backoff (2s, 4s)
+SKIP_WORDS = ("tts", "live", "image", "audio", "transcribe", "translate", "omni", "embed", "robot")
 RETRYABLE_CODES = {429, 500, 502, 503, 504}
 MAX_FILE_MB = 5
 MAX_CHARS = 15000  # resume text sent to the model
@@ -197,29 +198,46 @@ def _generate(client, types, model: str, prompt: str) -> str:
     return response.text
 
 
+def discover_flash_models(client) -> List[str]:
+    """Ask the API which Flash text models this key can use (last-resort fallback)."""
+    found = []
+    try:
+        for m in client.models.list():
+            name = str(getattr(m, "name", "")).replace("models/", "")
+            actions = getattr(m, "supported_actions", None) or []
+            if "flash" not in name or any(w in name for w in SKIP_WORDS):
+                continue
+            if actions and "generateContent" not in actions:
+                continue
+            found.append(name)
+    except Exception:
+        pass
+    return sorted(found, reverse=True)  # newest-looking names first
+
+
 def analyze_resume(resume, job_description, api_key, model, sleep=time.sleep):
     """Call Gemini with retries and model fallback. Returns (Analysis, model_used).
 
     - 429/5xx (e.g. "503 high demand"): retry with backoff, then try the next model.
-    - 404 (model name not found): go straight to the next model.
+    - 404 (model retired / name not available): go straight to the next model.
     - 400/401/403 (bad key or request): stop and report immediately.
+    - If the configured models all fail, ask the API for the Flash models this key can use.
     """
     from google import genai
     from google.genai import types
 
     client = genai.Client(api_key=api_key)
     prompt = build_prompt(resume, job_description)
-    models = [model] + [m for m in FALLBACK_MODELS if m != model]
-    last_error = None
+    state = {"last_error": None, "overloaded": False}
 
-    for name in models:
+    def try_model(name):
         for attempt in range(RETRIES_PER_MODEL):
             try:
-                return parse_response(_generate(client, types, name, prompt)), name
+                return parse_response(_generate(client, types, name, prompt))
             except ValueError as exc:  # unreadable JSON from the model: retry
-                last_error = exc
+                state["last_error"] = exc
             except Exception as exc:
-                last_error = exc
+                state["last_error"] = exc
                 code = _error_code(exc)
                 if code in (400, 401, 403):
                     raise RuntimeError(
@@ -227,15 +245,40 @@ def analyze_resume(resume, job_description, api_key, model, sleep=time.sleep):
                         f"and allowed to use this model. ({exc})"
                     ) from exc
                 if code == 404:
-                    break  # unknown model name -> next model
+                    return None  # model not available -> next model
                 if code not in RETRYABLE_CODES and "UNAVAILABLE" not in str(exc):
                     raise
+                state["overloaded"] = True
             if attempt < RETRIES_PER_MODEL - 1:
                 sleep(2 ** (attempt + 1))
+        return None
 
+    tried = []
+    for name in [model] + FALLBACK_MODELS:
+        if name in tried:
+            continue
+        tried.append(name)
+        result = try_model(name)
+        if result is not None:
+            return result, name
+
+    for name in discover_flash_models(client):
+        if name in tried:
+            continue
+        tried.append(name)
+        result = try_model(name)
+        if result is not None:
+            return result, name
+
+    if state["overloaded"]:
+        raise RuntimeError(
+            "Gemini is overloaded right now and all retries failed. Please try again in a "
+            f"minute. (Last error: {state['last_error']})"
+        )
     raise RuntimeError(
-        "Gemini is overloaded right now and all retries failed. "
-        f"Please try again in a minute. (Last error: {last_error})"
+        "No available Gemini model worked for this API key. Set a current model name in the "
+        f"sidebar (see ai.google.dev/gemini-api/docs/models). Tried: {', '.join(tried)}. "
+        f"(Last error: {state['last_error']})"
     )
 
 
